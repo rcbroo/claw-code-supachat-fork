@@ -439,6 +439,9 @@ struct StreamState {
     message_started: bool,
     text_started: bool,
     text_finished: bool,
+    /// Reasoning streaming is in progress — we've emitted the opening
+    /// marker on the text block and are appending reasoning tokens.
+    reasoning_open: bool,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
@@ -452,11 +455,32 @@ impl StreamState {
             message_started: false,
             text_started: false,
             text_finished: false,
+            reasoning_open: false,
             finished: false,
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
         }
+    }
+
+    /// Open a text block if one isn't already, then emit a single
+    /// TextDelta. Used by both the regular content path and the
+    /// reasoning passthrough so they share the "block 0 lifecycle"
+    /// bookkeeping.
+    fn emit_text_delta(events: &mut Vec<StreamEvent>, started: &mut bool, text: String) {
+        if !*started {
+            *started = true;
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Text {
+                    text: String::new(),
+                },
+            }));
+        }
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::TextDelta { text },
+        }));
     }
 
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
@@ -493,20 +517,37 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
+            // Reasoning passthrough: Ollama / Qwen3-Thinking / DeepSeek-R1 /
+            // Mistral-Reasoning emit chain-of-thought tokens via `reasoning`
+            // (or `reasoning_content` on DeepSeek). The OpenAI spec doesn't
+            // define this field, so historically we dropped it on the floor —
+            // which produced the "empty assistant bubble for a thinking model"
+            // black-hole symptom. We now stream reasoning into the text block
+            // wrapped in a markdown italic block so the user sees the model
+            // is alive and what it's thinking. When real `content` arrives,
+            // we close the reasoning wrapper before appending it.
+            if let Some(reasoning) = choice.delta.reasoning_text() {
+                if !self.reasoning_open {
+                    self.reasoning_open = true;
+                    Self::emit_text_delta(
+                        &mut events,
+                        &mut self.text_started,
+                        "*[thinking]*\n\n*".to_string(),
+                    );
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
+                Self::emit_text_delta(&mut events, &mut self.text_started, reasoning.to_string());
+            }
+
+            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                if self.reasoning_open {
+                    self.reasoning_open = false;
+                    Self::emit_text_delta(
+                        &mut events,
+                        &mut self.text_started,
+                        "*\n\n---\n\n".to_string(),
+                    );
+                }
+                Self::emit_text_delta(&mut events, &mut self.text_started, content);
             }
 
             for tool_call in choice.delta.tool_calls {
@@ -557,6 +598,18 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        // If the stream ended while still inside a reasoning wrapper
+        // (model ran out of tokens during chain-of-thought, or the
+        // provider didn't follow up with `content`), close the italic
+        // marker so the rendered output isn't a runaway italic block.
+        if self.reasoning_open {
+            self.reasoning_open = false;
+            Self::emit_text_delta(
+                &mut events,
+                &mut self.text_started,
+                "*\n\n_(no further response)_".to_string(),
+            );
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -735,8 +788,28 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Ollama / Qwen3-Thinking / Mistral-Reasoning emit chain-of-thought
+    /// tokens here (in addition to or instead of `content`). Non-standard
+    /// in OpenAI's spec but every reasoning-aware OpenAI-compat shim
+    /// surfaces it via this field name.
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// DeepSeek's variant of the same field.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+impl ChunkDelta {
+    /// Combined reasoning view — providers use either `reasoning` or
+    /// `reasoning_content`; the parser shouldn't care which.
+    fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning
+            .as_deref()
+            .or(self.reasoning_content.as_deref())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2206,5 +2279,86 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    // ── Reasoning passthrough (Ollama qwen3 / DeepSeek-R1 / Mistral) ─────
+
+    /// Concatenate every TextDelta a StreamState emits across a list of
+    /// raw SSE chunk JSON strings. Drops MessageStart / Stop / etc.
+    /// Returns the concatenated text exactly as the consumer would render it.
+    fn replay_text(chunks: &[&str]) -> String {
+        let mut state = super::StreamState::new("test-model".to_string());
+        let mut buf = String::new();
+        for raw in chunks {
+            let chunk: super::ChatCompletionChunk =
+                serde_json::from_str(raw).expect("chunk parses");
+            for ev in state.ingest_chunk(chunk).expect("ingest ok") {
+                if let crate::types::StreamEvent::ContentBlockDelta(e) = ev {
+                    if let crate::types::ContentBlockDelta::TextDelta { text } = e.delta {
+                        buf.push_str(&text);
+                    }
+                }
+            }
+        }
+        for ev in state.finish().expect("finish ok") {
+            if let crate::types::StreamEvent::ContentBlockDelta(e) = ev {
+                if let crate::types::ContentBlockDelta::TextDelta { text } = e.delta {
+                    buf.push_str(&text);
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn ollama_qwen3_reasoning_then_content_stream_surfaces_thinking_marker() {
+        // Real wire shape captured from a live Ollama qwen3:1.7b run.
+        let out = replay_text(&[
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Okay"},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":", just"},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"!"},"finish_reason":"stop"}]}"#,
+        ]);
+        // Expected layout: opening marker, the reasoning text, a separator,
+        // then the actual answer.
+        assert!(out.starts_with("*[thinking]*\n\n*Okay, just"), "got: {out:?}");
+        assert!(out.contains("\n\n---\n\n"), "missing separator: {out:?}");
+        assert!(out.ends_with("Hi!"), "got: {out:?}");
+    }
+
+    #[test]
+    fn deepseek_reasoning_content_field_is_also_surfaced() {
+        // DeepSeek-R1 uses `reasoning_content` instead of `reasoning`.
+        let out = replay_text(&[
+            r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"step 1: "},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"think","content":""},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}"#,
+        ]);
+        assert!(out.contains("step 1: think"), "got: {out:?}");
+        assert!(out.ends_with("answer"), "got: {out:?}");
+    }
+
+    #[test]
+    fn unfinished_reasoning_at_stream_end_closes_italic_marker() {
+        // Model exhausted max_tokens during reasoning and never produced
+        // visible content — without finish() closing the italic, the UI
+        // would render a runaway italic block.
+        let out = replay_text(&[
+            r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning":"hmm"},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+        assert!(out.contains("hmm*"), "got: {out:?}");
+        assert!(out.contains("(no further response)"), "got: {out:?}");
+    }
+
+    #[test]
+    fn no_reasoning_field_means_no_thinking_prefix_emitted() {
+        // Regression: non-reasoning models (codegemma, gpt-4o, etc.)
+        // must not pick up a thinking marker.
+        let out = replay_text(&[
+            r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}"#,
+        ]);
+        assert_eq!(out, "Hi!");
     }
 }
