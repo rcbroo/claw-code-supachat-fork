@@ -2268,9 +2268,16 @@ mod tests {
 
     #[test]
     fn provider_specific_size_limits_are_correct() {
-        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
-        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
     }
 
     #[test]
@@ -2321,7 +2328,10 @@ mod tests {
         ]);
         // Expected layout: opening marker, the reasoning text, a separator,
         // then the actual answer.
-        assert!(out.starts_with("*[thinking]*\n\n*Okay, just"), "got: {out:?}");
+        assert!(
+            out.starts_with("*[thinking]*\n\n*Okay, just"),
+            "got: {out:?}"
+        );
         assert!(out.contains("\n\n---\n\n"), "missing separator: {out:?}");
         assert!(out.ends_with("Hi!"), "got: {out:?}");
     }
